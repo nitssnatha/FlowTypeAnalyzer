@@ -1,67 +1,263 @@
 #!/bin/bash
 
-set -e
+set -e # Exit on any error
 
-copado --progress "=== Flow Type Checker ==="
+copado --progress "=== Navigating to Salesforce Flows Directory and Filtering by Commit ==="
 
-# Validate required parameters
-[ -z "$fileChangesId" ] && { copado --progress "ERROR: fileChangesId parameter required" -e; exit 1; }
+# --- Required Copado Parameters ---
+# branchName: The feature branch name (e.g., from $UserStory.Branch__c)
+# fileChangesId: The ID of the commit changes file (e.g., from $UserStory.Commit__r.FileChangesId__c)
+# flowTypes: Comma-separated list of flow processTypes to filter by (e.g., "AutoLaunchedFlow,ScreenFlow,RecordTriggeredFlow")
 
-# Set default flow type
-FLOW_TYPE="${flowType:-AutoLaunchedFlow}"
-copado --progress "Checking for flows of type: $FLOW_TYPE"
+if [ -z "$fileChangesId" ]; then
+    copado --progress "ERROR: Missing required parameter" -e "fileChangesId is not set. This is needed to filter flows by commit."
+    exit 1
+fi
 
-# Clone repository
-REPO_DIR="repo"
-mkdir -p "$REPO_DIR"
-copado-git-get -d "$REPO_DIR" "${branchName}" || { copado --progress "ERROR: Failed to clone repository" -e; exit 1; }
-cd "$REPO_DIR"
+# --- Define all common Salesforce Flow Types ---
+COMMON_FLOW_TYPES=(
+    "AutoLaunchedFlow"
+    "ScreenFlow"
+    "RecordTriggeredFlow"
+    "ScheduleTriggeredFlow"
+    "PlatformEventTriggeredFlow"
+    "UserProvisioningFlow"
+    "ContactRequestFlow"
+    "CheckoutFlow"
+    "InvocableProcess"
+    "LoginFlow"
+    "ActionPlan"
+    "JourneyBuilderIntegration"
+    "TransactionSecurityFlow"
+    "Survey"
+    "FSCLending"
+    "FieldServiceMobile"
+    "OrchestrationFlow"
+    "DigitalForm"
+    "CustomEvent"
+    "ApplicationProcess"
+    "ActionCadenceFlow"
+    "ManagedContentFlow"
+    "CustomerLifecycle"
+    "Journey"
+    "RecommendationStrategy"
+    "Appointments"
+    "Workflow"
+)
 
-# Download and parse commit file
-copado --downloadfiles "$fileChangesId" --downloaddir ./ || { copado --progress "ERROR: Failed to download commit file" -e; exit 1; }
-COMMIT_FILE=$(find . -maxdepth 1 -name "*Copado Commit changes*" -type f)
-[ -z "$COMMIT_FILE" ] && { copado --progress "ERROR: Commit file not found" -e; exit 1; }
+# --- Validate and process flow types parameter ---
+# This parameter should be configured in your Copado Function's parameters.
+# Example: flowTypes="AutoLaunchedFlow,ScreenFlow,RecordTriggeredFlow"
+# If not provided, it defaults to "AutoLaunchedFlow" for backward compatibility.
 
-# Extract flow names from commit
-FLOW_NAMES=$(jq -r '.[] | select(.t == "Flow") | .n' "$COMMIT_FILE" 2>/dev/null)
-if [ -z "$FLOW_NAMES" ]; then
-    copado --progress "No flows in commit"
-    HAS_FLOWS="false"
+if [ -z "$flowTypes" ]; then
+    copado --progress "WARNING: flowTypes parameter not set, defaulting to 'AutoLaunchedFlow'"
+    FLOW_TYPES_TO_SEARCH=("AutoLaunchedFlow")
 else
-    copado --progress "Flows found in commit: $(echo "$FLOW_NAMES" | wc -l)"
+    copado --progress "Processing flowTypes parameter: $flowTypes"
     
-    # Find flows directory
-    FLOWS_DIR=""
-    for dir in "force-app/main/default/flows" "src/flows" "unpackaged/flows"; do
-        [ -d "$dir" ] && { FLOWS_DIR="$dir"; break; }
-    done
+    # Convert comma-separated string to array
+    IFS=',' read -ra FLOW_TYPES_INPUT <<< "$flowTypes"
+    FLOW_TYPES_TO_SEARCH=()
     
-    if [ -z "$FLOWS_DIR" ]; then
-        copado --progress "WARNING: No flows directory found"
-        HAS_FLOWS="false"
-    else
-        copado --progress "Checking flows in: $FLOWS_DIR"
-        HAS_FLOWS="false"
+    # Validate each flow type against common types
+    for flow_type in "${FLOW_TYPES_INPUT[@]}"; do
+        # Trim whitespace
+        flow_type=$(echo "$flow_type" | xargs)
         
-        # Check each committed flow
-        echo "$FLOW_NAMES" | while read -r flow_name; do
-            [ -z "$flow_name" ] && continue
-            flow_file="$FLOWS_DIR/${flow_name}.flow-meta.xml"
+        # Check if the flow type is in the common types list
+        if printf '%s\n' "${COMMON_FLOW_TYPES[@]}" | grep -Fxq "$flow_type"; then
+            FLOW_TYPES_TO_SEARCH+=("$flow_type")
+            copado --progress "Valid flow type added: $flow_type"
+        else
+            copado --progress "WARNING: Unknown flow type '$flow_type' - adding anyway as it might be a custom type"
+            FLOW_TYPES_TO_SEARCH+=("$flow_type")
+        fi
+    done
+fi
+
+# Debug output to verify parameter values
+copado --progress "DEBUG: Original flowTypes parameter: '$flowTypes'"
+copado --progress "DEBUG: Flow types to search for: ${FLOW_TYPES_TO_SEARCH[*]}"
+copado --progress "DEBUG: Number of flow types to search: ${#FLOW_TYPES_TO_SEARCH[@]}"
+
+# Define the directory where the repository will be cloned
+REPO_DIR="repo"
+
+# Create the repository directory if it doesn't exist
+mkdir -p "$REPO_DIR"
+
+# Use copado-git-get to clone the repository into the REPO_DIR
+copado --progress "Retrieving repository: ${branchName}..."
+# Note: ${branchName} is expected to be provided by the Copado Function environment.
+copado-git-get -d "$REPO_DIR" "${branchName}"
+if [ $? -ne 0 ]; then
+    copado --progress "ERROR: copado-git-get failed for branch ${branchName}" -e "Directory: ${REPO_DIR}"
+    exit 1
+fi
+
+# Verify the repository was cloned successfully
+if [ ! -d "$REPO_DIR" ] || [ -z "$(ls -A "$REPO_DIR")" ]; then
+    copado --progress "ERROR: Repository directory '$REPO_DIR' not found or is empty after copado-git-get."
+    exit 1
+fi
+
+# Change to the cloned repository directory
+cd "$REPO_DIR"
+if [ $? -ne 0 ]; then
+    copado --progress "ERROR: Could not change into repository directory '$REPO_DIR'."
+    exit 1
+fi
+
+copado --progress "Repository retrieved and entered successfully."
+copado --progress "Current branch: $(git branch --show-current 2>/dev/null || echo 'Unknown')"
+
+# --- Download User Story commit changes file ---
+copado --progress "Downloading commit changes file for ID: $fileChangesId"
+copado --downloadfiles "$fileChangesId" --downloaddir ./
+if [ $? -ne 0 ]; then
+    copado --progress "ERROR: Failed to download commit changes file" -e "File ID: $fileChangesId"
+    exit 1
+fi
+
+COMMIT_FILE=$(find . -maxdepth 1 -type f -name "*Copado Commit changes*" -print -quit)
+if [ -z "$COMMIT_FILE" ]; then
+    copado --progress "ERROR: Commit file not found" -e "Unable to locate Copado Commit changes file in current directory (./)"
+    exit 1
+fi
+copado --progress "Found commit file: $COMMIT_FILE"
+
+# --- Extract valid flow names from commit data ---
+copado --progress "Extracting valid flow names from commit file: $COMMIT_FILE"
+temp_flow_file=$(mktemp)
+# Ensure the jq query matches the structure of your commit file.
+# This assumes the commit file is a JSON array of objects, where each object has 't' (type) and 'n' (name).
+jq -r '.[] | select(.t == "Flow" and .n) | .n' "$COMMIT_FILE" > "$temp_flow_file"
+jq_exit_status=$?
+if [ $jq_exit_status -ne 0 ]; then
+    copado --progress "ERROR: jq command failed to process commit file or extract flow names. Exit status: $jq_exit_status" -e "File: $COMMIT_FILE. Ensure it's valid JSON and the query is correct."
+    copado --progress "INFO: Content of commit file ($COMMIT_FILE):"
+    cat "$COMMIT_FILE" # Log content of commit file for debugging
+    rm -f "$temp_flow_file"
+    exit 1
+fi
+
+VALID_FLOW_NAMES=$(cat "$temp_flow_file")
+rm -f "$temp_flow_file"
+
+flow_names_in_commit_count=$(echo "$VALID_FLOW_NAMES" | wc -l)
+if [ "$flow_names_in_commit_count" -gt 0 ] && [ -n "$VALID_FLOW_NAMES" ]; then
+    copado --progress "Found $flow_names_in_commit_count flow name(s) in commit:"
+    echo "$VALID_FLOW_NAMES" | while IFS= read -r flow; do
+        copado --progress "  - $flow"
+    done
+else
+    copado --progress "WARNING: No flow names extracted from commit file. This script will not find any flows matching the commit."
+fi
+
+# Define common Salesforce source format locations for flows
+FLOW_PATHS=(
+    "force-app/main/default/flows"
+    # Add other potential flow paths if needed, e.g., for different package structures
+    # "unpackaged/flows"
+)
+
+flows_directory_found=false
+flows_in_folder_count=0 # Initialize flow count in folder
+
+# Variable to store the final result
+FLOW_NEEDS_TEST="false"
+
+# Iterate through possible flow paths to find the first existing one
+for flow_path in "${FLOW_PATHS[@]}"; do
+    if [ -d "$flow_path" ]; then
+        copado --progress "Found flows directory: $flow_path"
+        # Change into the found flows directory
+        cd "$flow_path"
+        if [ $? -ne 0 ]; then
+            copado --progress "ERROR: Could not change into flows directory '$flow_path'."
+            exit 1
+        fi
+        copado --progress "Successfully navigated to: $(pwd)"
+        flows_directory_found=true
+
+        # Count the number of .flow-meta.xml files in the current directory
+        flows_in_folder_count=$(find . -maxdepth 1 -type f -name "*.flow-meta.xml" | wc -l)
+
+        copado --progress "--- Committed Flows Analysis ---"
+        copado --progress "Searching for flow types: ${FLOW_TYPES_TO_SEARCH[*]}"
+        
+        total_matching_flows=0
+        
+        # Process each flow file to extract its type
+        for flow_file in *.flow-meta.xml; do
             if [ -f "$flow_file" ]; then
-                flow_type=$(grep -o '<processType>[^<]*</processType>' "$flow_file" | sed 's/<[^>]*>//g')
-                if [ "$flow_type" = "$FLOW_TYPE" ]; then
-                    copado --progress "Found matching flow: $flow_name"
-                    HAS_FLOWS="true"
-                    break
+                flow_name=$(basename "$flow_file" .flow-meta.xml)
+
+                # First, check if the flow name is in the list of committed flows
+                if echo "$VALID_FLOW_NAMES" | grep -Fxq "$flow_name"; then
+                    # Extract processType using grep and sed
+                    flow_type=$(grep -o '<processType>[^<]*</processType>' "$flow_file" 2>/dev/null | sed 's/<[^>]*>//g')
+
+                    # Check if the flow type matches any of the specified types
+                    for target_flow_type in "${FLOW_TYPES_TO_SEARCH[@]}"; do
+                        if [ "$flow_type" = "$target_flow_type" ]; then
+                            copado --progress "Found matching flow - Name: $flow_name, Type: $flow_type"
+                            FLOW_NEEDS_TEST="true"
+                            total_matching_flows=$((total_matching_flows + 1))
+                            break
+                        fi
+                    done
                 fi
             fi
         done
+        
+        copado --progress "Total matching flows found: $total_matching_flows"
+
+        if [ "$FLOW_NEEDS_TEST" = "false" ]; then
+            copado --progress "No committed flows found with any of the specified types: ${FLOW_TYPES_TO_SEARCH[*]}"
+        fi
+
+        break # Exit the loop once the first flows directory is found and navigated into
+    fi
+done
+
+if [ "$flows_directory_found" = false ]; then
+    copado --progress "ERROR: No flow metadata directories found in this repository at the expected paths."
+    copado --progress "ERROR: Checked paths: ${FLOW_PATHS[*]}"
+    exit 1
+fi
+
+# --- Report the result using copado --progress and --result-data ---
+# Get the previous step's result data to extract the commit ID
+PREV_STEP_RESULT="{$Job.PrevStep.ResultDataJson__c}"
+copado --progress "Previous step result: $PREV_STEP_RESULT"
+
+# Extract commit ID from previous step result using jq
+COMMIT_ID=""
+if [ -n "$PREV_STEP_RESULT" ] && [ "$PREV_STEP_RESULT" != "null" ]; then
+    COMMIT_ID=$(echo "$PREV_STEP_RESULT" | jq -r '.commitId // empty' 2>/dev/null)
+    if [ -z "$COMMIT_ID" ]; then
+        # Try alternative field names in case the structure is different
+        COMMIT_ID=$(echo "$PREV_STEP_RESULT" | jq -r '.commit_id // .id // empty' 2>/dev/null)
     fi
 fi
 
-# Get commit ID from previous step
-COMMIT_ID=$(echo "$PREV_STEP_RESULT" | jq -r '.commitId // .commit_id // .id // empty' 2>/dev/null || echo "")
+# Create the simplified result JSON with only FlowNeedsTest and commitId
+if [ -n "$COMMIT_ID" ]; then
+    RESULT_JSON="{\"FlowNeedsTest\": $FLOW_NEEDS_TEST, \"commitId\": \"$COMMIT_ID\"}"
+    copado --progress "Including commit ID from previous step: $COMMIT_ID"
+else
+    RESULT_JSON="{\"FlowNeedsTest\": $FLOW_NEEDS_TEST, \"commitId\": null}"
+    copado --progress "WARNING: No commit ID found in previous step result"
+fi
 
-# Output result
-RESULT_JSON="{\"hasAutolaunchedFlows\": $HAS_FLOWS, \"commitId\": $([ -n "$COMMIT_ID" ] && echo "\"$COMMIT_ID\"" || echo "null")}"
-copado --progress "Analysis complete" --result-data "$RESULT_JSON"
+copado --progress "Navigation and Flow Type Extraction Complete" --result-data "$RESULT_JSON"
+if [ $? -ne 0 ]; then
+    copado --progress "ERROR: Failed to report result using copado --result-data." -e "Payload: $RESULT_JSON"
+    exit 1
+fi
+
+# You can add further commands here that need to be executed within the 'flows' directory.
+# For example, to list the contents of the directory:
+# ls -la
